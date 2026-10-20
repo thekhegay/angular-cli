@@ -28,7 +28,7 @@ import { BuilderState } from './builder-state';
 import type { ExecutionResult } from './execution-result';
 import { normalizeLibraryOptions } from './options';
 import type { BuildActionContext } from './pipeline/build-action';
-import { updateWatchedEntryPoints } from './pipeline/entry-points';
+import { expandExportPatterns, updateWatchedEntryPoints } from './pipeline/entry-points';
 import { loadPackageJson } from './pipeline/utils';
 import type { Schema as LibraryBuilderOptions } from './schema';
 import type { NormalizedLibraryOptions } from './types';
@@ -272,6 +272,11 @@ async function* runWatchLoop(
       buildState.hasEmittedManifests = false;
       try {
         const packageJson = await loadPackageJson(packageJsonPath);
+        packageJson.exports = await expandExportPatterns(
+          packageJson.exports,
+          options.projectRoot,
+          packageJsonPath,
+        );
         updateWatchedEntryPoints(packageJson, options, buildState);
         hasPackageJsonError = false;
       } catch (error) {

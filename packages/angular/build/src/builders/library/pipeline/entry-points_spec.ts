@@ -6,7 +6,10 @@
  * found in the LICENSE file at https://angular.dev/license
  */
 
-import { join } from 'node:path';
+import assert from 'node:assert';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { toPosixPath } from '../../../utils/path';
 import { BuilderState } from '../builder-state';
 import type {
   BundleResult,
@@ -16,6 +19,7 @@ import type {
 } from '../types';
 import {
   collectEntryPointsToBundle,
+  expandExportPatterns,
   getEntryPointBundleName,
   haveEntryPointsChanged,
   normalizeEntryPoints,
@@ -471,6 +475,63 @@ describe('entry-points pipeline', () => {
         ),
       ).toThrowError(
         /Duplicate entry point detected: '\.\/zz-child' resolves to the same bundle name \('my-scope-my-lib-zz-child'\)/,
+      );
+    });
+  });
+
+  describe('expandExportPatterns', () => {
+    it('should expand TypeScript subpath patterns like Node.js resolves them', async () => {
+      const baseTmpDir = process.env['TEST_TMPDIR'];
+      assert(baseTmpDir, 'TEST_TMPDIR is not set');
+      const tempRoot = toPosixPath(await mkdtemp(join(baseTmpDir, 'angular-cli-entry-points-')));
+
+      try {
+        for (const file of [
+          'a/public-api.ts',
+          'a/testing/index.ts',
+          'a/testing/public-api.ts',
+          'b/public-api.ts',
+          'b/internal/public-api.ts',
+          'utils/format.ts',
+          'utils/format.d.ts',
+        ]) {
+          await mkdir(dirname(join(tempRoot, file)), { recursive: true });
+          await writeFile(join(tempRoot, file), '');
+        }
+
+        const expandedExports = await expandExportPatterns(
+          {
+            '.': './public-api.ts',
+            './*': { sass: './*/_index.scss', default: './*/public-api.ts' },
+            './*/testing': './*/testing/index.ts',
+            './*/internal': null,
+            './b': './b/public-api.ts',
+            './utils/*': './utils/*.ts',
+            './i18n/*.json': './i18n/*.json',
+          },
+          tempRoot,
+          packageJsonPath,
+        );
+
+        expect(Object.entries(expandedExports as Record<string, unknown>)).toEqual([
+          ['.', './public-api.ts'],
+          ['./a', { sass: './a/_index.scss', default: './a/public-api.ts' }],
+          ['./a/testing', './a/testing/index.ts'],
+          ['./*/internal', null],
+          ['./b', './b/public-api.ts'],
+          ['./utils/format', './utils/format.ts'],
+          ['./i18n/*.json', './i18n/*.json'],
+        ]);
+      } finally {
+        await rm(tempRoot, { recursive: true, force: true });
+      }
+    });
+
+    it('should return exports without TypeScript subpath patterns unchanged', async () => {
+      const rawExports = { '.': './src/public-api.ts', './schematics/*': './schematics/*' };
+
+      expect(await expandExportPatterns(rawExports, projectRoot, packageJsonPath)).toEqual(
+        rawExports,
       );
     });
   });

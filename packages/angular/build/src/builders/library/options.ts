@@ -20,7 +20,7 @@ import {
   loadPostcssConfiguration,
 } from '../../utils/postcss-configuration';
 import { getProjectRootPaths } from '../../utils/project-metadata';
-import { normalizeEntryPoints } from './pipeline/entry-points';
+import { expandExportPatterns, normalizeEntryPoints } from './pipeline/entry-points';
 import { loadPackageJson } from './pipeline/utils';
 import type { Schema as LibraryBuilderOptions } from './schema';
 import type { NormalizedLibraryOptions, PackageJsonData } from './types';
@@ -79,6 +79,12 @@ export async function normalizeLibraryOptions(
   if (!packageName) {
     throw new Error(`The package.json at '${packageJsonPath}' must contain a 'name'.`);
   }
+
+  packageJson.exports = await expandExportPatterns(
+    packageJson.exports,
+    projectRoot,
+    packageJsonPath,
+  );
 
   const entryPoints = normalizeEntryPoints(
     packageJson.exports,

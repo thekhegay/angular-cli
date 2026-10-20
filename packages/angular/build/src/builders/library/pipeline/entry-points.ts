@@ -7,6 +7,7 @@
  */
 
 import path from 'node:path';
+import { escapePath, glob } from 'tinyglobby';
 import { isSubDirectory, toPosixPath } from '../../../utils/path';
 import type { BuilderState } from '../builder-state';
 import type { NormalizedEntryPoint, NormalizedLibraryOptions, PackageJsonData } from '../types';
@@ -109,6 +110,141 @@ function resolveTarget(value: unknown): string | undefined {
   }
 
   return undefined;
+}
+
+/**
+ * Expands subpath patterns in `package.json` `exports` whose target is a TypeScript file into
+ * one subpath per matching file, following the Node.js rules for resolving `exports`: the '*'
+ * matches any non-empty string including '/', an exact subpath takes precedence over a pattern
+ * and the most specific pattern wins, so a pattern with a `null` target excludes its matches.
+ * Other keys are kept as is.
+ *
+ * @param rawExports The `exports` field from `package.json`.
+ * @param projectRoot The library project root POSIX directory path.
+ * @param packageJsonPath POSIX path to `package.json` for error reporting.
+ * @returns The `exports` field with TypeScript subpath patterns replaced by the matched subpaths.
+ */
+export async function expandExportPatterns(
+  rawExports: PackageJsonData['exports'],
+  projectRoot: string,
+  packageJsonPath: string,
+): Promise<PackageJsonData['exports']> {
+  if (!rawExports || typeof rawExports !== 'object' || Array.isArray(rawExports)) {
+    return rawExports;
+  }
+
+  const keys = Object.keys(rawExports);
+  if (!keys.some((key) => key.startsWith('.') && key.includes('*'))) {
+    return rawExports;
+  }
+
+  const patternKeys = keys
+    .filter((key) => key.indexOf('*') !== -1 && key.indexOf('*') === key.lastIndexOf('*'))
+    .sort((a, b) => b.indexOf('*') - a.indexOf('*') || b.length - a.length);
+
+  const expandedExports: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(rawExports)) {
+    const target = resolveTarget(value);
+    if (!key.includes('*') || !target || !/(?<!\.d)\.m?ts$/.test(target)) {
+      expandedExports[key] = value;
+      continue;
+    }
+
+    if (key.split('*').length !== 2 || target.split('*').length !== 2) {
+      throw new Error(
+        `Invalid subpath pattern '${key}' in '${packageJsonPath}': the key and its TypeScript file path must each contain exactly one '*'.`,
+      );
+    }
+
+    const matches = await findPatternMatches(target, projectRoot);
+    if (matches.length === 0) {
+      throw new Error(
+        `Subpath pattern '${key}' in '${packageJsonPath}' did not match any files: '${target}'.`,
+      );
+    }
+
+    const [keyPrefix, keySuffix] = key.split('*');
+    for (const match of matches) {
+      const subpath = keyPrefix + match + keySuffix;
+      if (Object.hasOwn(rawExports, subpath)) {
+        continue;
+      }
+
+      const bestPatternKey = patternKeys.find((patternKey) => {
+        const [base, trailer] = patternKey.split('*');
+
+        return (
+          subpath.startsWith(base) &&
+          subpath.endsWith(trailer) &&
+          subpath.length >= patternKey.length
+        );
+      });
+      if (bestPatternKey === key) {
+        expandedExports[subpath] = replacePatternMatch(value, match);
+      }
+    }
+  }
+
+  return expandedExports;
+}
+
+/**
+ * Finds the TypeScript files matching a subpath pattern target.
+ *
+ * @param target The relative file path containing a single '*'.
+ * @param projectRoot The library project root POSIX directory path.
+ * @returns The values matched by '*', sorted.
+ */
+async function findPatternMatches(target: string, projectRoot: string): Promise<string[]> {
+  const [prefix, suffix] = toPosixPath(path.resolve(projectRoot, target)).split('*');
+  const cwd = prefix.slice(0, prefix.lastIndexOf('/') + 1);
+  const files = await glob(`**/*${escapePath(suffix.slice(suffix.lastIndexOf('/') + 1))}`, {
+    cwd,
+    ignore: ['**/node_modules/**'],
+  });
+
+  const matches: string[] = [];
+  for (const file of files) {
+    const filePath = cwd + file;
+    if (
+      filePath.length > prefix.length + suffix.length &&
+      filePath.startsWith(prefix) &&
+      filePath.endsWith(suffix) &&
+      !/\.d\.m?ts$/.test(filePath)
+    ) {
+      matches.push(filePath.slice(prefix.length, filePath.length - suffix.length));
+    }
+  }
+
+  return matches.sort();
+}
+
+/**
+ * Replaces every '*' in the string targets of an export value with the matched value.
+ *
+ * @param value The raw export value of a subpath pattern.
+ * @param match The value matched by '*'.
+ * @returns The export value for the matched subpath.
+ */
+function replacePatternMatch(value: unknown, match: string): unknown {
+  if (typeof value === 'string') {
+    return value.replaceAll('*', match);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => replacePatternMatch(item, match));
+  }
+
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value).map(([condition, item]) => [
+        condition,
+        replacePatternMatch(item, match),
+      ]),
+    );
+  }
+
+  return value;
 }
 
 /**
